@@ -21,7 +21,8 @@ NTPClient timeClient(ntpUDP);
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 
-// enable OTA updates
+// OTA Updates — ESP8266 Arduino Core 2.4.0 documentation
+// https://arduino-esp8266.readthedocs.io/en/latest/ota_updates/readme.html
 #include <ArduinoOTA.h>
 
 // For WifiManager
@@ -44,22 +45,22 @@ private:
 public:
 	void start()
 	{
-		this->startTime = micros();
+		startTime = micros();
 	}
 
 	boolean delayMicros(unsigned long duration)
 	{
-		return(micros() - this->startTime >= duration);
+		return(micros() - startTime >= duration);
 	}
 
 	boolean delayMillis(unsigned long duration)
 	{
-		return(this->delayMicros(duration*1000));
+		return(delayMicros(duration*1000));
 	}
 
 	unsigned long elapsedMicros()
 	{
-		return(micros() - this->startTime);
+		return(micros() - startTime);
 	}
 
 	unsigned long elapsedMillis()
@@ -315,7 +316,7 @@ void setup() {
     Serial.println("OTA Start");
   });
   ArduinoOTA.onEnd([]() {
-    Serial.println("OTA End");
+    Serial.println("\nOTA End");
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     Serial.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
