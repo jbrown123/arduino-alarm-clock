@@ -1,16 +1,15 @@
 #include <NTPClient.h>
+
 // change next line to use with another board/shield
 #include <ESP8266WiFi.h>
-//#include <WiFi.h> // for WiFi shield
-//#include <WiFi101.h> // for WiFi 101 shield or MKR1000
+
 #include <WiFiUdp.h>
 
 #include <TM1637Display.h>
 
 #include "secret.h"
 
-const char *ssid     = SSIDWIFI;
-const char *password = WIFIPASS;
+#include "pt-1.4/pt.h"
 
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP);
@@ -22,6 +21,9 @@ NTPClient timeClient(ntpUDP);
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 
+// enable OTA updates
+#include <ArduinoOTA.h>
+
 // For WifiManager
 #include <DNSServer.h>
 #include <WiFiManager.h>         //https://github.com/tzapu/WiFiManager
@@ -30,11 +32,47 @@ NTPClient timeClient(ntpUDP);
 // Available on the library manager (ArduinoJson)
 // https://github.com/bblanchon/ArduinoJson
 
-#include <GoogleMapsDirectionsApi.h>
-
 #include <WiFiClientSecure.h>
 
 #include "pitches.h"
+
+class hiresTimer
+{
+private:
+	unsigned long startTime;
+	
+public:
+	void start()
+	{
+		this->startTime = micros();
+	}
+
+	boolean delayMicros(unsigned long duration)
+	{
+		return(micros() - this->startTime >= duration);
+	}
+
+	boolean delayMillis(unsigned long duration)
+	{
+		return(this->delayMicros(duration*1000));
+	}
+
+	unsigned long elapsedMicros()
+	{
+		return(micros() - this->startTime);
+	}
+
+	unsigned long elapsedMillis()
+	{
+		return(elapsedMicros() / 1000);
+	}
+};
+
+boolean globalAlarmState = true;
+
+#define ENABLE_TRAFFIC 0
+#if ENABLE_TRAFFIC
+#include <GoogleMapsDirectionsApi.h>
 
 bool enableTrafficAdjust = false;
 
@@ -49,13 +87,45 @@ String waypoints = ""; //You need to include the via: before your waypoint
 
 //Optional
 DirectionsInputOptions inputOptions;
+#endif
 
 // For storing configurations
 #include "FS.h"
+// see http://esp8266.github.io/Arduino/versions/2.0.0/doc/filesystem.html
+// The following diagram illustrates flash layout used in Arduino environment:
+// |--------------|-------|---------------|--|--|--|--|--|
+// ^              ^       ^               ^     ^
+// Sketch    OTA update   File system   EEPROM  WiFi config (SDK)
+
+// from wemos website
+// wemos d1 mini using ESP8266MOD
+/*
+	Pin	Function						ESP-8266 Pin
+	TX	TXD								TXD
+	RX	RXD								RXD
+	A0	Analog input, max 3.3V input	A0
+	D0	IO								GPIO16
+	D1	IO, SCL							GPIO5
+	D2	IO, SDA							GPIO4
+	D3	IO, 10k Pull-up					GPIO0
+	D4	IO, 10k Pull-up, BUILTIN_LED	GPIO2
+	D5	IO, SCK							GPIO14
+	D6	IO, MISO						GPIO12
+	D7	IO, MOSI						GPIO13
+	D8	IO, 10k Pull-down, SS			GPIO15
+	G	Ground							GND
+	5V	5V								-
+	3V3	3.3V							3.3V
+	RST	Reset							RST
+	All of the IO pins have interrupt/pwm/I2C/one-wire support except D0.
+	All of the IO pins run at 3.3V.
+*/
 
 // Module connection pins (Digital Pins)
 #define CLK D6
 #define DIO D5
+
+#define BUILTIN_LED	D4
 
 #define ALARM D1
 
@@ -74,11 +144,13 @@ const uint8_t LETTER_E = SEG_A | SEG_D | SEG_E | SEG_F | SEG_G;
 const uint8_t LETTER_F = SEG_A | SEG_E | SEG_F | SEG_G;
 
 const uint8_t LETTER_O = SEG_C | SEG_D | SEG_E | SEG_G;
+const uint8_t LETTER_N = SEG_C | SEG_E | SEG_G;
+const uint8_t LETTER_T = SEG_D | SEG_E | SEG_F | SEG_G;
 
 const uint8_t SEG_CONF[] = {
   LETTER_C,                                        // C
   LETTER_O,                                        // o
-  SEG_C | SEG_E | SEG_G,                           // n
+  LETTER_N,                                        // n
   LETTER_F                                         // F
 };
 
@@ -86,7 +158,7 @@ const uint8_t SEG_BOOT[] = {
   LETTER_B,                                        // b
   LETTER_O,                                        // o
   LETTER_O,                                        // o
-  SEG_D | SEG_E | SEG_F | SEG_G                    // t - kinda
+  LETTER_T                                         // t - kinda
 };
 
 ESP8266WebServer server(80);
@@ -115,8 +187,6 @@ void handleNotFound() {
   server.send(404, "text/plain", message);
 }
 
-//MAPS_API_KEY
-
 int alarmHour = 0;
 int alarmMinute = 0;
 bool alarmActive = false;
@@ -131,7 +201,10 @@ void handleGetAlarm() {
 int trafficOffset = 0;
 
 WiFiClientSecure client;
+
+#if ENABLE_TRAFFIC
 GoogleMapsDirectionsApi api(MAPS_API_KEY, client);
+#endif
 
 // From World clock example in timezone library
 // United Kingdom (London, Belfast)
@@ -147,6 +220,11 @@ Timezone ausET(aEDT, aEST);
 TimeChangeRule usEDT = {"EDT", Second, Sun, Mar, 2, -240};  // Eastern Daylight Time = UTC - 4 hours
 TimeChangeRule usEST = {"EST", First, Sun, Nov, 2, -300};   // Eastern Standard Time = UTC - 5 hours
 Timezone usET(usEDT, usEST);
+
+// US Mountain Time Zone (Denver, Salt Lake City)
+TimeChangeRule usMDT = {"MDT", Second, Sun, Mar, 2, -360};  // Eastern Daylight Time = UTC - 4 hours
+TimeChangeRule usMST = {"MST", First, Sun, Nov, 2, -420};   // Eastern Standard Time = UTC - 5 hours
+Timezone usMT(usMDT, usMST);
 
 void configModeCallback (WiFiManager *myWiFiManager) {
   Serial.println("Entered config mode");
@@ -165,7 +243,7 @@ void setup() {
 
   loadConfig();
 
-  display.setBrightness(0xff);
+  display.setBrightness(7);	// max brightness
   display.setSegments(SEG_BOOT);
 
   pinMode(ALARM, OUTPUT);
@@ -179,10 +257,26 @@ void setup() {
   WiFiManager wifiManager;
   wifiManager.setAPCallback(configModeCallback);
   wifiManager.autoConnect("AlarmClock", "password");
-
+/*
+	Chip ID
+	5372786
+	Flash Chip ID
+	1458270
+	IDE Flash Size
+	4194304 bytes
+	Real Flash Size
+	4194304 bytes
+	Soft AP IP
+	192.168.4.1
+	Soft AP MAC
+	62:01:94:51:FB:72
+	Station MAC
+	60:01:94:51:FB:72
+ */
+ 
   Serial.println("");
   Serial.print("Connected to ");
-  Serial.println(ssid);
+  Serial.println(WiFi.SSID());
   Serial.print("IP address: ");
 
   IPAddress ipAddress = WiFi.localIP();
@@ -192,32 +286,90 @@ void setup() {
 
   delay(1000);
 
-
-
-  if (MDNS.begin("alarm")) {
-    Serial.println("MDNS Responder Started");
-  }
+//  if (MDNS.begin("alarmclock")) {
+//    Serial.println("MDNS Responder Started");
+//  }
 
   server.on("/", handleRoot);
   server.on("/setAlarm", handleSetAlarm);
   server.on("/getAlarm", handleGetAlarm);
-  
-
-
-
-  timeClient.begin();
-
   server.onNotFound(handleNotFound);
 
   server.begin();
   Serial.println("HTTP Server Started");
 
+  timeClient.begin();
+
+  // enable over the air updates
+
+  // Port defaults to 8266
+  // ArduinoOTA.setPort(8266);
+
+  // Hostname defaults to esp8266-[ChipID]
+  ArduinoOTA.setHostname("alarmclock");
+
+  // No authentication by default
+  // ArduinoOTA.setPassword((const char *)"123");
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA End");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();	// start the OTA responder
+  Serial.println("OTA server started");
+
+#if ENABLE_TRAFFIC
   //These are all optional (although departureTime needed for traffic)
   inputOptions.departureTime = "now"; //can also be a future timestamp
   inputOptions.trafficModel = "best_guess"; //Defaults to this anyways
   inputOptions.avoid = "ferries";
   inputOptions.units = "metric";
+#endif
 
+/*
+	for (int i = 0; i < 20; i++)
+	{
+		tone(ALARM, NOTE_C4);
+		delay(10);
+		noTone(ALARM);
+		delay(240);
+	}
+	delay(500);
+	
+	unsigned long timeStart = millis();
+	while (millis() - timeStart < 1500)
+	{
+		// generate a 440Hz tone
+		for (unsigned long toneStart = micros(); micros() - toneStart < 1000000/(NOTE_C4*2);)
+		{
+			// 20% duty cycle at 50KHz
+			unsigned long volStart = micros();
+			digitalWrite(ALARM, 1);
+			while (micros() - volStart < 10)
+				;
+	
+			volStart = micros();
+			digitalWrite(ALARM, 0);
+			while (micros() - volStart < 40)
+				;
+		}
+		for (unsigned long toneStart = micros(); micros() - toneStart < 1000000/(NOTE_C4*2);)
+			;
+	}
+*/
 }
 
 bool loadConfig() {
@@ -290,22 +442,38 @@ void handleSetAlarm() {
 }
 
 // notes in the melody:
+/*
 int melody[] = {
   NOTE_C4, NOTE_G3, NOTE_G3, NOTE_A3, NOTE_G3, 0, NOTE_B3, NOTE_C4
 };
-
 // note durations: 4 = quarter note, 8 = eighth note, etc.:
 int noteDurations[] = {
   4, 8, 8, 4, 4, 4, 4, 4
 };
+*/
+
+int melody[] = {
+  1, 2, 3, 4, 5
+};
+
+// note durations: 4 = quarter note, 8 = eighth note, etc.:
+int noteDurations[] = {
+  1, 1, 1, 1, 1
+};
+
+// https://www.reddit.com/r/arduino/comments/4l2pfe/now_arduinos_tone_function_has_8bit_volume_control/
 
 void soundAlarm() {
-  for (int thisNote = 0; thisNote < 8; thisNote++) {
+  if (!globalAlarmState)
+  	return;
+  	
+  for (int thisNote = 0; thisNote < (sizeof(melody) / sizeof(melody[0])); thisNote++) {
 
     // to calculate the note duration, take one second divided by the note type.
     //e.g. quarter note = 1000 / 4, eighth note = 1000/8, etc.
     int noteDuration = 1000 / noteDurations[thisNote];
-    tone(ALARM, melody[thisNote], noteDuration);
+    if (melody[thisNote] > 0)
+	    tone(ALARM, melody[thisNote], noteDuration);
 
     // to distinguish the notes, set a minimum time between them.
     // the note's duration + 30% seems to work well:
@@ -318,8 +486,7 @@ void soundAlarm() {
 
 bool dotsOn = false;
 
-unsigned long oneSecondLoopDue = 0;
-
+#if ENABLE_TRAFFIC
 void checkGoogleMaps() {
   Serial.println("Getting traffic for " + origin + " to " + destination);
   DirectionsResponse response = api.directionsApi(origin, destination, inputOptions);
@@ -353,33 +520,109 @@ void checkGoogleMaps() {
   Serial.print("Traffic Offset: ");
   Serial.println(trafficOffset);
 }
+#endif
 
-void loop() {
+#define timeUpdateInterval (1000 * 60 * 1)
+#define errorTimeUpdateInterval	(1000 * 30)
+
+// current real-time state of the buttons
+// left button (snooze) returns 2, right button returns 1
+uint8_t ButtonState()
+{
+	return ((digitalRead(SNOOZE_BUTTON) == LOW ? 2 : 0) | (digitalRead(BUTTON) == LOW ? 1 : 0));
+}
+
+uint8_t ButtonChange()
+{
+	static uint8_t lastButtonState = 0;
+
+	uint8_t curr = ButtonState();
+
+	// which have changed anded with current = what's newly on
+	uint8_t retval = (lastButtonState ^ curr) & curr;
+
+	// remember the new value
+	lastButtonState = curr;
+
+	return(retval);
+}
+
+#define buttonLongPressInterval	1900
+
+void loop() 
+{
+  ArduinoOTA.handle();
+	
   unsigned long now = millis();
+  static unsigned long lastUpdateTime = 0;
+  static boolean timeUpdateSuccess = false;
+  static unsigned long lastScreenUpdate = 0;
+  static unsigned long buttonDownStartTime = 0;
 
-  if(digitalRead(SNOOZE_BUTTON) == LOW && digitalRead(BUTTON) == LOW){
+  if ( ButtonState() == 1 ) {
+  	if (buttonDownStartTime == 0)
+  		buttonDownStartTime = now;
+  	else if (now - buttonDownStartTime > buttonLongPressInterval)
+  	{
+  		// Serial.print("button down time "); Serial.println(now - buttonDownStartTime);
+  		
+  		// toggle global alarm state
+  		globalAlarmState = !globalAlarmState;
+  		// reset timer
+  		buttonDownStartTime = 0;
+  	}
+  } else
+  	buttonDownStartTime = 0;
+
+  if(ButtonState() == 3){
     int sensorValue = analogRead(LDR);
+    display.setBrightness(sensorValue/256);	// 0 = dim, 7 = max bright
     display.showNumberDec(sensorValue, false);
-    oneSecondLoopDue = now;
-  } else if ( digitalRead(SNOOZE_BUTTON) == LOW) {
+    lastScreenUpdate = 0;
+  } else if ( ButtonState() == 2 ) {
     IPAddress ipAddress = WiFi.localIP();
     display.showNumberDec(ipAddress[3], false);
-    oneSecondLoopDue = now;
+    lastScreenUpdate = 0;
   } else {
-    if (now > oneSecondLoopDue) {
-      timeClient.update();
-      displayTime(dotsOn);
+  	// NTP update
+  	if (lastUpdateTime == 0 
+  		|| now - lastUpdateTime > timeUpdateInterval
+  		|| (!timeUpdateSuccess && now - lastUpdateTime > errorTimeUpdateInterval) )
+  	{
+      timeUpdateSuccess = timeClient.update();
+      lastUpdateTime = now;
+  	}
+
+	// screen update
+  	if (lastScreenUpdate == 0 || now - lastScreenUpdate > 1000)
+  	{
+      // brightness doesn't change until the next display update
+      display.setBrightness(analogRead(LDR)/256);	// 0 = dim, 7 = max bright
+
+      // if we can't get NTP, then flash the time
+      if (!timeUpdateSuccess)
+      {
+      	if (dotsOn)
+      		displayTime(dotsOn);
+      	else
+      		display.clear();
+      }
+      else
+      	displayTime(dotsOn);
       dotsOn = !dotsOn;
+      
+      lastScreenUpdate = now;
+    }
+
+    // alarm check
       checkForAlarm();
       if (buttonPressed) {
         alarmHandled = true;
         buttonPressed = false;
       }
-      oneSecondLoopDue = now + 1000;
-    }
   }
 
-
+#if ENABLE_TRAFFIC
   if (enableTrafficAdjust)
   {
     if ((now > api_due_time))  {
@@ -388,6 +631,7 @@ void loop() {
       api_due_time = now + api_mtbs;
     }
   }
+#endif
 
   server.handleClient();
 }
@@ -458,24 +702,41 @@ void interuptButton()
 
 void displayTime(bool dotsVisible) {
 
-  unsigned long epoch = UK.toLocal(timeClient.getEpochTime());
+  unsigned long epoch = usMT.toLocal(timeClient.getEpochTime());
 
-  timeHour = (epoch  % 86400L) / 3600;
+  timeHour = (epoch % 86400L) / 3600;
   timeMinutes = (epoch % 3600) / 60;
 
   uint8_t data[4];
 
-  if (timeHour < 10) {
-    data[0] = display.encodeDigit(0);
-    data[1] = display.encodeDigit(timeHour);
+  uint8_t hr = timeHour;
+  uint8_t pmFlag = 0;
+  
+  if (hr > 11)
+  	pmFlag = 1;
+  	
+  if (hr == 0)
+  	hr = 12;
+  else if (hr > 12)
+  	hr -= 12;
+  	
+  if (hr < 10) {
+    data[0] = 0;	// display.encodeDigit(0);
+    data[1] = display.encodeDigit(hr);
   } else {
-    data[0] = display.encodeDigit(timeHour / 10);
-    data[1] = display.encodeDigit(timeHour % 10);
+    data[0] = display.encodeDigit(hr / 10);
+    data[1] = display.encodeDigit(hr % 10);
   }
+
+  // use left column as AM/PM flag
+  data[0] |= pmFlag ? SEG_E : SEG_F;
 
   if (dotsVisible) {
     // Turn on double dots
     data[1] = data[1] | B10000000;
+    
+	// use left dash as alarm disable flag
+	data[0] |= globalAlarmState ? 0 : SEG_G;
   }
 
   if (timeMinutes < 10) {
@@ -485,6 +746,7 @@ void displayTime(bool dotsVisible) {
     data[2] = display.encodeDigit(timeMinutes / 10);
     data[3] = display.encodeDigit(timeMinutes % 10);
   }
-
+  
   display.setSegments(data);
 }
+

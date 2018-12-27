@@ -1,5 +1,4 @@
-R"(
-<!DOCTYPE html>
+R"EOS(<!DOCTYPE html>
 <html>
   <head>
     <meta charset="utf-8">
@@ -28,9 +27,10 @@ R"(
     <script> function saveAlarm()
              {
                 var alarmTime = $( "#time" ).val();
+                var dayNum = 1;
                 if(alarmTime) {
                   console.log(alarmTime);
-                  makeAjaxCall("setAlarm?alarm=" + alarmTime);
+                  makeAjaxCall("setAlarm?alarm=" + alarmTime + "&day=" + dayNum);
                 }
              }
 
@@ -48,6 +48,4 @@ R"(
              }
     </script>
   </body>
-</html>
-
-)"
+</html>)EOS"
