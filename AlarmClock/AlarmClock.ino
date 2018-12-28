@@ -35,7 +35,7 @@ NTPClient timeClient(ntpUDP);
 
 #include <WiFiClientSecure.h>
 
-#include "pitches.h"
+#include <NonBlockingRtttl.h>
 
 class hiresTimer
 {
@@ -69,26 +69,45 @@ public:
 	}
 };
 
+// thread states
+struct
+{
+	struct pt	pt;
+	
+	unsigned long lastUpdateTime = 0;
+	boolean timeUpdateSuccess = false;
+} timeUpdateState;
+
+struct
+{
+	struct pt	pt;
+	
+	unsigned long lastScreenUpdate = 0;
+	boolean dotsOn;
+	boolean displayDisabled;
+} displayUpdateState;
+
+struct
+{
+	struct pt	pt;
+} rtttlPlayerState;
+
+struct
+{
+	struct pt	pt;
+
+	int lastMinute;
+	class hiresTimer	timer;
+} alarmThreadState;
+
+
+char *startupSound = "Star Trek:d=16,o=5,b=120:8f.,a#,4d#.6,8d6,a#.,g.,c.6,4f6";
+char *alarmSound = "Ring Low High:d=16,o=5,b=355:b4,d,b4,d,b4,d,b4,d,d,f,d,f,d,f,d,f,f,a,f,a,f,a,f,a,2p,b5,d6,b5,d6,b5,d6,b5,d6,d6,f6,d6,f6,d6,f6,d6,f6,f6,a6,f6,a6,f6,a6,f6,a6,1p";
+
 boolean globalAlarmState = true;
 
-#define ENABLE_TRAFFIC 0
-#if ENABLE_TRAFFIC
-#include <GoogleMapsDirectionsApi.h>
-
-bool enableTrafficAdjust = false;
-
-//Free Google Maps Api only allows for 2500 "elements" a day, so carful you dont go over
-unsigned long api_mtbs = 60000; //mean time between api requests
-unsigned long api_due_time = 0;
-bool firstTime = true;
-
-String origin = "40.8359838,-73.8734402";
-String destination = "40.8536064,-73.9667197";
-String waypoints = ""; //You need to include the via: before your waypoint
-
-//Optional
-DirectionsInputOptions inputOptions;
-#endif
+void displayTime(bool dotsVisible);
+bool checkForAlarm();
 
 // For storing configurations
 #include "FS.h"
@@ -203,10 +222,6 @@ int trafficOffset = 0;
 
 WiFiClientSecure client;
 
-#if ENABLE_TRAFFIC
-GoogleMapsDirectionsApi api(MAPS_API_KEY, client);
-#endif
-
 // From World clock example in timezone library
 // United Kingdom (London, Belfast)
 TimeChangeRule BST = {"BST", Last, Sun, Mar, 1, 60};        // British Summer Time
@@ -234,8 +249,16 @@ void configModeCallback (WiFiManager *myWiFiManager) {
   display.setSegments(SEG_CONF);
 }
 
-void setup() {
+void setup() 
+{
   Serial.begin(115200);
+
+  // init all the thread variables
+  PT_INIT(&timeUpdateState.pt);
+  PT_INIT(&displayUpdateState.pt);
+  PT_INIT(&rtttlPlayerState.pt);
+  PT_INIT(&alarmThreadState.pt);
+
 
   if (!SPIFFS.begin()) {
     Serial.println("Failed to mount FS");
@@ -247,13 +270,14 @@ void setup() {
   display.setBrightness(7);	// max brightness
   display.setSegments(SEG_BOOT);
 
+  pinMode(BUILTIN_LED, OUTPUT);
+  digitalWrite(BUILTIN_LED, HIGH);	// off
+     
   pinMode(ALARM, OUTPUT);
   digitalWrite(ALARM, LOW);
 
   pinMode(BUTTON, INPUT_PULLUP);
   pinMode(SNOOZE_BUTTON, INPUT_PULLUP);
-
-  attachInterrupt(BUTTON, interuptButton, RISING);
 
   WiFiManager wifiManager;
   wifiManager.setAPCallback(configModeCallback);
@@ -332,13 +356,7 @@ void setup() {
   ArduinoOTA.begin();	// start the OTA responder
   Serial.println("OTA server started");
 
-#if ENABLE_TRAFFIC
-  //These are all optional (although departureTime needed for traffic)
-  inputOptions.departureTime = "now"; //can also be a future timestamp
-  inputOptions.trafficModel = "best_guess"; //Defaults to this anyways
-  inputOptions.avoid = "ferries";
-  inputOptions.units = "metric";
-#endif
+  rtttl::begin(ALARM, startupSound);
 
 /*
 	for (int i = 0; i < 20; i++)
@@ -422,8 +440,9 @@ bool saveConfig() {
   return true;
 }
 
-void handleSetAlarm() {
+int alarmDay;
 
+void handleSetAlarm() {
   Serial.println("Setting Alarm");
   for (uint8_t i = 0; i < server.args(); i++) {
     if (server.argName(i) == "alarm") {
@@ -431,100 +450,28 @@ void handleSetAlarm() {
       int indexOfColon = alarm.indexOf(":");
       alarmHour = alarm.substring(0, indexOfColon).toInt();
       alarmMinute = alarm.substring(indexOfColon + 1).toInt();
-      alarmActive = true;
+      alarmDay = alarm.substring(alarm.indexOf(";")+1).toInt();
+      alarmActive = (alarmHour == 0 && alarmMinute == 0) ? false : true;
       saveConfig();
       Serial.print("Setting Alarm to: ");
       Serial.print(alarmHour);
       Serial.print(":");
       Serial.print(alarmMinute);
+      Serial.print(";");
+      Serial.print(alarmDay);
     }
   }
   server.send(200, "text/html", "Set Alarm");
 }
 
-// notes in the melody:
-/*
-int melody[] = {
-  NOTE_C4, NOTE_G3, NOTE_G3, NOTE_A3, NOTE_G3, 0, NOTE_B3, NOTE_C4
-};
-// note durations: 4 = quarter note, 8 = eighth note, etc.:
-int noteDurations[] = {
-  4, 8, 8, 4, 4, 4, 4, 4
-};
-*/
+void soundAlarm() 
+{
+	if (!globalAlarmState)
+		return;
 
-int melody[] = {
-  1, 2, 3, 4, 5
-};
-
-// note durations: 4 = quarter note, 8 = eighth note, etc.:
-int noteDurations[] = {
-  1, 1, 1, 1, 1
-};
-
-// https://www.reddit.com/r/arduino/comments/4l2pfe/now_arduinos_tone_function_has_8bit_volume_control/
-
-void soundAlarm() {
-  if (!globalAlarmState)
-  	return;
-  	
-  for (int thisNote = 0; thisNote < (sizeof(melody) / sizeof(melody[0])); thisNote++) {
-
-    // to calculate the note duration, take one second divided by the note type.
-    //e.g. quarter note = 1000 / 4, eighth note = 1000/8, etc.
-    int noteDuration = 1000 / noteDurations[thisNote];
-    if (melody[thisNote] > 0)
-	    tone(ALARM, melody[thisNote], noteDuration);
-
-    // to distinguish the notes, set a minimum time between them.
-    // the note's duration + 30% seems to work well:
-    int pauseBetweenNotes = noteDuration * 1.30;
-    delay(pauseBetweenNotes);
-    // stop the tone playing:
-    noTone(ALARM);
-  }
+	if (!rtttl::isPlaying())
+		rtttl::begin(ALARM, alarmSound);
 }
-
-bool dotsOn = false;
-
-#if ENABLE_TRAFFIC
-void checkGoogleMaps() {
-  Serial.println("Getting traffic for " + origin + " to " + destination);
-  DirectionsResponse response = api.directionsApi(origin, destination, inputOptions);
-  if (response.duration_value == 0) {
-    delay(100);
-    response = api.directionsApi(origin, destination, inputOptions);
-  }
-  Serial.println("Response:");
-  Serial.print("Trafic from ");
-  Serial.print(response.start_address);
-  Serial.print(" to ");
-  Serial.println(response.end_address);
-
-  Serial.print("Duration in Traffic text: ");
-  Serial.println(response.durationTraffic_text);
-  Serial.print("Duration in Traffic in Seconds: ");
-  Serial.println(response.durationTraffic_value);
-
-  Serial.print("Normal duration text: ");
-  Serial.println(response.duration_text);
-  Serial.print("Normal duration in Seconds: ");
-  Serial.println(response.duration_value);
-
-  Serial.print("Distance text: ");
-  Serial.println(response.distance_text);
-  Serial.print("Distance in meters: ");
-  Serial.println(response.distance_value);
-
-  trafficOffset = (response.durationTraffic_value - response.duration_value) / 60 ;
-
-  Serial.print("Traffic Offset: ");
-  Serial.println(trafficOffset);
-}
-#endif
-
-#define timeUpdateInterval (1000 * 60 * 1)
-#define errorTimeUpdateInterval	(1000 * 30)
 
 // current real-time state of the buttons
 // left button (snooze) returns 2, right button returns 1
@@ -548,206 +495,240 @@ uint8_t ButtonChange()
 	return(retval);
 }
 
+#define timeUpdateInterval (1000 * 60 * 1)
+#define errorTimeUpdateInterval	(1000 * 30)
+
+PT_THREAD(DisplayUpdateThread(void))
+{
+	struct pt *pt = &displayUpdateState.pt;
+	unsigned long now = millis();
+	
+	PT_BEGIN(pt);
+
+	while(1)
+	{
+		// screen update
+		PT_WAIT_UNTIL(pt, !displayUpdateState.displayDisabled && 
+			(displayUpdateState.lastScreenUpdate == 0 || now - displayUpdateState.lastScreenUpdate > 1000));
+		
+		// brightness doesn't change until the next display update
+		display.setBrightness(analogRead(LDR)/256);	// 0 = dim, 7 = max bright
+		
+		// if we can't get NTP, then flash the time
+		if (!timeUpdateState.timeUpdateSuccess)
+		{
+			if (displayUpdateState.dotsOn)
+				displayTime(displayUpdateState.dotsOn);
+			else
+				display.clear();
+		}
+		else
+			displayTime(displayUpdateState.dotsOn);
+	
+		displayUpdateState.dotsOn = !displayUpdateState.dotsOn;
+		
+		displayUpdateState.lastScreenUpdate = now;
+	}
+	
+	PT_END(pt);
+}
+
+PT_THREAD(TimeUpdateThread(void))
+{
+	struct pt *pt = &timeUpdateState.pt;
+	unsigned long now = millis();
+	
+	PT_BEGIN(pt);
+
+	// get initial time
+	timeUpdateState.timeUpdateSuccess = timeClient.update();
+	timeUpdateState.lastUpdateTime = now;
+
+	while(1)
+	{
+		// do updates infrequently unless there's an error
+	  	PT_WAIT_UNTIL(pt, now - timeUpdateState.lastUpdateTime > timeUpdateInterval
+	  		|| (!timeUpdateState.timeUpdateSuccess && now - timeUpdateState.lastUpdateTime > errorTimeUpdateInterval) );
+
+	  	// no updates while playing
+		PT_WAIT_UNTIL(pt, !rtttl::isPlaying());
+		
+	  	// NTP update
+		timeUpdateState.timeUpdateSuccess = timeClient.update();
+		timeUpdateState.lastUpdateTime = now;
+	}
+	
+	PT_END(pt);
+}
+
+// https://www.reddit.com/r/arduino/comments/4l2pfe/now_arduinos_tone_function_has_8bit_volume_control/
+
+PT_THREAD(RtttlPlayerThread())
+{
+	struct pt *pt = &rtttlPlayerState.pt;
+
+	PT_BEGIN(pt);
+
+	while(1)
+	{
+		if (rtttl::isPlaying())
+			rtttl::play();	// keep playing stuff
+		
+		PT_YIELD(pt);
+	}
+	
+	PT_END(pt);
+}
+
+PT_THREAD(AlarmThread())
+{
+	struct pt *pt = &alarmThreadState.pt;
+
+	int timeHour;
+	int timeMinutes;
+	boolean alarmCheck = false;	// once each minute this is set to true;
+	
+	unsigned long epoch = usMT.toLocal(timeClient.getEpochTime());
+	
+	timeHour = (epoch % 86400L) / 3600;
+	timeMinutes = (epoch % 3600) / 60;
+
+	// check at each minute change for alarm activation
+	if (timeMinutes != alarmThreadState.lastMinute)
+		alarmCheck = true;
+		
+	alarmThreadState.lastMinute = timeMinutes;
+
+	byte buttons = ButtonState();
+	
+	PT_BEGIN(pt);
+
+	while(1)
+	{
+	    // alarm check
+	    PT_WAIT_UNTIL(globalAlarmState && alarmCheck && timeHour == alarmHour && timeMinutes == alarmMinute);
+
+		while (buttons == 0)
+		{
+			// keep ringing the alarm until user presses a button
+			soundAlarm();
+
+			// wait until user presses a button OR we finish playing
+			PT_WAIT_UNTIL(pt, buttons != 0 || !rtttl::isPlaying());
+		}
+		
+		rtttl::stop();	// stop the alarm
+	}
+	
+	PT_END(pt);
+}
+
 #define buttonLongPressInterval	1900
 
 void loop() 
 {
-  ArduinoOTA.handle();
+	AlarmThread();	// should come before time update
+	RtttlPlayerThread();
+	TimeUpdateThread();
+	DisplayUpdateThread();
 	
-  unsigned long now = millis();
-  static unsigned long lastUpdateTime = 0;
-  static boolean timeUpdateSuccess = false;
-  static unsigned long lastScreenUpdate = 0;
-  static unsigned long buttonDownStartTime = 0;
+	ArduinoOTA.handle();
+	server.handleClient();
 
-  if ( ButtonState() == 1 ) {
-  	if (buttonDownStartTime == 0)
-  		buttonDownStartTime = now;
-  	else if (now - buttonDownStartTime > buttonLongPressInterval)
-  	{
-  		// Serial.print("button down time "); Serial.println(now - buttonDownStartTime);
-  		
-  		// toggle global alarm state
-  		globalAlarmState = !globalAlarmState;
-  		// reset timer
-  		buttonDownStartTime = 0;
-  	}
-  } else
-  	buttonDownStartTime = 0;
+	unsigned long now = millis();
+	static unsigned long buttonDownStartTime = 0;
 
-  if(ButtonState() == 3){
-    int sensorValue = analogRead(LDR);
-    display.setBrightness(sensorValue/256);	// 0 = dim, 7 = max bright
-    display.showNumberDec(sensorValue, false);
-    lastScreenUpdate = 0;
-  } else if ( ButtonState() == 2 ) {
-    IPAddress ipAddress = WiFi.localIP();
-    display.showNumberDec(ipAddress[3], false);
-    lastScreenUpdate = 0;
-  } else {
-  	// NTP update
-  	if (lastUpdateTime == 0 
-  		|| now - lastUpdateTime > timeUpdateInterval
-  		|| (!timeUpdateSuccess && now - lastUpdateTime > errorTimeUpdateInterval) )
-  	{
-      timeUpdateSuccess = timeClient.update();
-      lastUpdateTime = now;
-  	}
+	if ( ButtonState() == 1 ) {
+		if (buttonDownStartTime == 0)
+			buttonDownStartTime = now;
+		else if (now - buttonDownStartTime > buttonLongPressInterval)
+		{
+			// Serial.print("button down time "); Serial.println(now - buttonDownStartTime);
+			
+			// toggle global alarm state
+			globalAlarmState = !globalAlarmState;
+			// reset timer
+			buttonDownStartTime = 0;
+		}
+	} else
+		buttonDownStartTime = 0;
 
-	// screen update
-  	if (lastScreenUpdate == 0 || now - lastScreenUpdate > 1000)
-  	{
-      // brightness doesn't change until the next display update
-      display.setBrightness(analogRead(LDR)/256);	// 0 = dim, 7 = max bright
+	if(ButtonState() == 3)
+	{
+		displayUpdateState.displayDisabled = true;
+		
+		int sensorValue = analogRead(LDR);
+		display.setBrightness(sensorValue/256);	// 0 = dim, 7 = max bright
+		display.showNumberDec(sensorValue, false);
+		displayUpdateState.lastScreenUpdate = 0;
+	} else if ( ButtonState() == 2 ) 
+	{
+		displayUpdateState.displayDisabled = true;
 
-      // if we can't get NTP, then flash the time
-      if (!timeUpdateSuccess)
-      {
-      	if (dotsOn)
-      		displayTime(dotsOn);
-      	else
-      		display.clear();
-      }
-      else
-      	displayTime(dotsOn);
-      dotsOn = !dotsOn;
-      
-      lastScreenUpdate = now;
-    }
-
-    // alarm check
-      checkForAlarm();
-      if (buttonPressed) {
-        alarmHandled = true;
-        buttonPressed = false;
-      }
-  }
-
-#if ENABLE_TRAFFIC
-  if (enableTrafficAdjust)
-  {
-    if ((now > api_due_time))  {
-      inputOptions.waypoints = waypoints;
-      checkGoogleMaps();
-      api_due_time = now + api_mtbs;
-    }
-  }
-#endif
-
-  server.handleClient();
+		IPAddress ipAddress = WiFi.localIP();
+		display.showNumberDec(ipAddress[3], false);
+		displayUpdateState.lastScreenUpdate = 0;
+	} else
+		displayUpdateState.displayDisabled = false;
 }
 
-int timeHour;
-int timeMinutes;
-
-int lastEffectiveAlarm = 0;
-
-//bool checkForAlarm()
-//{
-//  int effectiveAlarmMinute = alarmMinute;
-//  int effectiveAlarmHour = alarmHour;
-//  int actualAlarmMinutesFromMidnight = (alarmHour * 60) + alarmMinute;
-//  int effectiveAlarmMinutesFromMidnight = actualAlarmMinutesFromMidnight;
-//  if (trafficOffset != 0)
-//  {
-//    effectiveAlarmMinutesFromMidnight -= trafficOffset;
-//
-//    if (effectiveAlarmHour > 1439)
-//    {
-//      effectiveAlarmMinutesFromMidnight = effectiveAlarmMinutesFromMidnight % 1440;
-//    }
-//
-//    if (effectiveAlarmHour < 0)
-//    {
-//      effectiveAlarmMinutesFromMidnight = (1440 + effectiveAlarmMinutesFromMidnight) % 1440;
-//    }
-//  }
-//
-//  int minutesSinceMidnight = (hour * 60) + minutes;
-//
-//  if (alarmActive) {
-//    if (minutesSinceMidnight >= effectiveAlarmMinutesFromMidnight) {
-//      if (minutesSinceMidnight <= actualAlarmMinutesFromMidnight + 30) {
-//        if (!alarmHandled)
-//        {
-//          soundAlarm();
-//        }
-//      }
-//    }
-//
-//  } else if (minutesSinceMidnight = 0) {
-//    alarmHandled = false;
-//  }
-//
-//  lastEffectiveAlarm = effectiveAlarmMinutesFromMidnight;
-//}
-
-bool checkForAlarm()
+void displayTime(bool dotsVisible) 
 {
-  if (alarmActive && timeHour == alarmHour && timeMinutes == alarmMinute) {
-    if (!alarmHandled)
-    {
-      soundAlarm();
-    }
-  } else {
-    alarmHandled = false;
-  }
-}
-
-void interuptButton()
-{
-  // Serial.println("interuptButton");
-  buttonPressed = true;
-  return;
-}
-
-void displayTime(bool dotsVisible) {
-
-  unsigned long epoch = usMT.toLocal(timeClient.getEpochTime());
-
-  timeHour = (epoch % 86400L) / 3600;
-  timeMinutes = (epoch % 3600) / 60;
-
-  uint8_t data[4];
-
-  uint8_t hr = timeHour;
-  uint8_t pmFlag = 0;
-  
-  if (hr > 11)
-  	pmFlag = 1;
-  	
-  if (hr == 0)
-  	hr = 12;
-  else if (hr > 12)
-  	hr -= 12;
-  	
-  if (hr < 10) {
-    data[0] = 0;	// display.encodeDigit(0);
-    data[1] = display.encodeDigit(hr);
-  } else {
-    data[0] = display.encodeDigit(hr / 10);
-    data[1] = display.encodeDigit(hr % 10);
-  }
-
-  // use left column as AM/PM flag
-  data[0] |= pmFlag ? SEG_E : SEG_F;
-
-  if (dotsVisible) {
-    // Turn on double dots
-    data[1] = data[1] | B10000000;
-    
-	// use left dash as alarm disable flag
-	data[0] |= globalAlarmState ? 0 : SEG_G;
-  }
-
-  if (timeMinutes < 10) {
-    data[2] = display.encodeDigit(0);
-    data[3] = display.encodeDigit(timeMinutes);
-  } else {
-    data[2] = display.encodeDigit(timeMinutes / 10);
-    data[3] = display.encodeDigit(timeMinutes % 10);
-  }
-  
-  display.setSegments(data);
+	int timeHour;
+	int timeMinutes;
+	
+	unsigned long epoch = usMT.toLocal(timeClient.getEpochTime());
+	
+	timeHour = (epoch % 86400L) / 3600;
+	timeMinutes = (epoch % 3600) / 60;
+	
+	uint8_t data[4];
+	
+	uint8_t hr = timeHour;
+	uint8_t pmFlag = 0;
+	
+	if (hr > 11)
+		pmFlag = 1;
+	
+	if (hr == 0)
+		hr = 12;
+	else if (hr > 12)
+		hr -= 12;
+	
+	if (hr < 10) 
+	{
+		data[0] = 0;	// display.encodeDigit(0);
+		data[1] = display.encodeDigit(hr);
+	} 
+	else 
+	{
+		data[0] = display.encodeDigit(hr / 10);
+		data[1] = display.encodeDigit(hr % 10);
+	}
+	
+	// use left column as AM/PM flag
+	data[0] |= pmFlag ? SEG_E : SEG_F;
+	
+	if (dotsVisible) 
+	{
+		// Turn on double dots
+		data[1] = data[1] | B10000000;
+		
+		// use left dash as alarm disable flag
+		data[0] |= globalAlarmState ? 0 : SEG_G;
+	}
+	
+	if (timeMinutes < 10) 
+	{
+		data[2] = display.encodeDigit(0);
+		data[3] = display.encodeDigit(timeMinutes);
+	} 
+	else
+	{
+		data[2] = display.encodeDigit(timeMinutes / 10);
+		data[3] = display.encodeDigit(timeMinutes % 10);
+	}
+	
+	display.setSegments(data);
 }
 

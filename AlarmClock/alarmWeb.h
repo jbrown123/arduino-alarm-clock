@@ -10,7 +10,15 @@ R"EOS(<!DOCTYPE html>
     <div class="container-fluid">
       <div class="col-xs-12"  style="height: 100vh">
         <h1>Alarm Clock - Set your alarm</h1>
-        <input id="time" type="time">
+        <table border=0>
+        <tr><td>Sun</td><td><input id="time0" type="time"></td></tr>
+        <tr><td>Mon</td><td><input id="time1" type="time"></td></tr>
+        <tr><td>Tue</td><td><input id="time2" type="time"></td></tr>
+        <tr><td>Wed</td><td><input id="time3" type="time"></td></tr>
+        <tr><td>Thu</td><td><input id="time4" type="time"></td></tr>
+        <tr><td>Fri</td><td><input id="time5" type="time"></td></tr>
+        <tr><td>Sat</td><td><input id="time6" type="time"></td></tr>
+        </table>
         <div class="row" padding-bottom:1em">
           <div class="col-xs-4" style="height: 100%; text-align: center">
             <button id="sendAlarm" type="button" class="btn btn-default" style="height: 100%; width: 100%" onclick='saveAlarm()'>Send Alarm</button>
@@ -23,15 +31,26 @@ R"EOS(<!DOCTYPE html>
     </div>
     <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.12.4/jquery.min.js"></script>
     <script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/js/bootstrap.min.js"></script> 
-    <script> function makeAjaxCall(url){$.ajax({"url": url})}</script>
     <script> function saveAlarm()
              {
-                var alarmTime = $( "#time" ).val();
-                var dayNum = 1;
-                if(alarmTime) {
-                  console.log(alarmTime);
-                  makeAjaxCall("setAlarm?alarm=" + alarmTime + "&day=" + dayNum);
-                }
+             	var dayNum = 0;
+
+				function nextAlarm()
+             	{
+             		if (dayNum >= 7)
+             			return;
+
+             		var dy = dayNum++;
+             		
+	                var alarmTime = $( "#time"+dy ).val();
+					console.log("day: " + dy + " alarm: " + alarmTime);
+	                if(alarmTime)
+						$.ajax({"url": "setAlarm?alarm=" + alarmTime + ";" + dy, "success": nextAlarm});
+					else
+						$.ajax({"url": "setAlarm?alarm=0:0;" + dy, "success": nextAlarm});
+             	}
+             	
+             	nextAlarm();	// kick us off
              }
 
              window.setInterval(getAlarm, 2000);
@@ -39,7 +58,7 @@ R"EOS(<!DOCTYPE html>
 
              function displayAlarm(data){
               var text = "Alarm currently set to: " + data;
-               $("#currentAlarm").html(data);
+               $("#currentAlarm").html(text);
              }
 
              function getAlarm(){
