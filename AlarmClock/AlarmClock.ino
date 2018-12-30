@@ -39,35 +39,58 @@ NTPClient timeClient(ntpUDP);
 
 class hiresTimer
 {
-private:
+protected:
 	unsigned long startTime;
 	
 public:
+	// sets the start time of the timer
 	void start()
 	{
 		startTime = micros();
 	}
 
+	// returns true if the specified duration (in microseconds) has elapsed
 	boolean delayMicros(unsigned long duration)
 	{
 		return(micros() - startTime >= duration);
 	}
 
+	// returns true if the specified duration (in milliseconds) has elapsed
 	boolean delayMillis(unsigned long duration)
 	{
 		return(delayMicros(duration*1000));
 	}
 
+	// returns the elapsed time in microseconds
 	unsigned long elapsedMicros()
 	{
 		return(micros() - startTime);
 	}
 
+	// returns the elapsed time in milliseconds
 	unsigned long elapsedMillis()
 	{
 		return(elapsedMicros() / 1000);
 	}
 };
+
+char *startupSound = "Star Trek:d=16,o=5,b=120:8f.,a#,4d#.6,8d6,a#.,g.,c.6,4f6";
+char *alarmSound = "Ring Low High:d=16,o=5,b=355:b4,d,b4,d,b4,d,b4,d,d,f,d,f,d,f,d,f,f,a,f,a,f,a,f,a,2p,b5,d6,b5,d6,b5,d6,b5,d6,d6,f6,d6,f6,d6,f6,d6,f6,f6,a6,f6,a6,f6,a6,f6,a6,1p";
+// 10 ticks:d=1,o=4,b=240:100c,4p,100c,4p,100c,4p,100c,4p,100c,4p,100c,4p,100c,4p,100c,4p,100c,4p,100c,4p
+
+
+// here is all the alarm info
+struct
+{
+	char alarmSound[2049];	// the alarm tune
+	byte volume;	// 1-100% (really only works in 10% increments; 10-100)
+	struct 
+	{
+		byte alarmHour;
+		byte alarmMinute;
+	} alarmDay[7];	// one for each day, 0=Sun ... 6=Sat
+} alarmInfo;
+
 
 // thread states
 struct
@@ -99,10 +122,6 @@ struct
 	int lastMinute;
 	class hiresTimer	timer;
 } alarmThreadState;
-
-
-char *startupSound = "Star Trek:d=16,o=5,b=120:8f.,a#,4d#.6,8d6,a#.,g.,c.6,4f6";
-char *alarmSound = "Ring Low High:d=16,o=5,b=355:b4,d,b4,d,b4,d,b4,d,d,f,d,f,d,f,d,f,f,a,f,a,f,a,f,a,2p,b5,d6,b5,d6,b5,d6,b5,d6,d6,f6,d6,f6,d6,f6,d6,f6,f6,a6,f6,a6,f6,a6,f6,a6,1p";
 
 boolean globalAlarmState = true;
 
@@ -207,18 +226,87 @@ void handleNotFound() {
   server.send(404, "text/plain", message);
 }
 
-int alarmHour = 0;
-int alarmMinute = 0;
-bool alarmActive = false;
-bool alarmHandled = false;
-bool buttonPressed = false;
+boolean webActive = false;
 
 void handleGetAlarm() {
-  String alarmString = String(alarmHour) + ":" + String(alarmMinute);
+  // single threaded
+  if (webActive)
+  {
+    server.send(503, "text/html", "busy - single threaded");
+  	return;
+  }
+  webActive = true;
+
+  StaticJsonBuffer<2048> jsonBuffer;
+  JsonObject& json = jsonBuffer.createObject();
+
+  json["alarmSound"] = alarmInfo.alarmSound;
+  
+  json["volume"] = alarmInfo.volume;
+
+  JsonArray& dayArray = jsonBuffer.createArray();
+  
+  for (int i = 0; i < 7; i++)
+  {
+  	JsonObject& obj = dayArray.createNestedObject();
+  	
+  	obj["alarmHour"] = alarmInfo.alarmDay[i].alarmHour;
+  	obj["alarmMinute"] = alarmInfo.alarmDay[i].alarmMinute;
+  }
+
+  json["alarmDay"] = dayArray;
+
+  String alarmString;
+  json.prettyPrintTo(alarmString);
+
   server.send(200, "text/plain", alarmString);
+
+  webActive = false;
 }
 
-int trafficOffset = 0;
+void handleSetAlarm() 
+{
+  // single threaded
+  if (webActive)
+  {
+    server.send(503, "text/html", "busy - single threaded");
+  	return;
+  }
+  webActive = true;
+
+  for (uint8_t i = 0; i < server.args(); i++) {
+    if (server.argName(i) == "alarm") {
+      String alarm = server.arg(i);
+ 
+      int indexOfColon = alarm.indexOf(":");
+      
+      byte alarmHour = constrain(alarm.substring(0, indexOfColon).toInt(), 0, 23);
+      byte alarmMinute = constrain(alarm.substring(indexOfColon + 1).toInt(), 0, 59);
+      byte alarmDay = constrain(alarm.substring(alarm.indexOf(";")+1).toInt(), 0, 6);
+
+      alarmInfo.alarmDay[alarmDay].alarmHour = alarmHour;
+      alarmInfo.alarmDay[alarmDay].alarmMinute = alarmMinute;
+      
+    }
+    if (server.argName(i) == "alarmSound")
+    {
+    	if (server.arg(i).length() <= 2048)
+    		strcpy(alarmInfo.alarmSound, server.arg(i).c_str());
+    		
+    	if (strlen(alarmInfo.alarmSound) < 10)
+    		strcpy(alarmInfo.alarmSound, alarmSound);	// default sound
+    }
+    if (server.argName(i) == "volume")
+   		alarmInfo.volume = constrain(server.arg(i).toInt(), 10, 100);
+  }
+  
+  saveConfig();
+  
+  server.send(200, "text/html", "Alarm Set");
+  
+  webActive=false;
+}
+
 
 WiFiClientSecure client;
 
@@ -392,77 +480,45 @@ void setup()
 }
 
 bool loadConfig() {
-  File configFile = SPIFFS.open("/alarm.json", "r");
+  File configFile = SPIFFS.open("/alarm.dat", "r");
   if (!configFile) {
     Serial.println("Failed to open config file");
+
+  	strcpy(alarmInfo.alarmSound, alarmSound);	// default sound
+    alarmInfo.volume = 100;	// limit to 10 - 100
+    
     return false;
   }
 
   size_t size = configFile.size();
-  if (size > 1024) {
-    Serial.println("Config file size is too large");
+  if (size != sizeof(alarmInfo) ) {
+    Serial.println("Config file size is incorrect");
     return false;
   }
 
-  // Allocate a buffer to store contents of the file.
-  std::unique_ptr<char[]> buf(new char[size]);
+  configFile.readBytes((char *) &alarmInfo, sizeof(alarmInfo));
+  configFile.close();
 
-  configFile.readBytes(buf.get(), size);
+  if (strlen(alarmInfo.alarmSound) < 10)
+  	strcpy(alarmInfo.alarmSound, alarmSound);	// default sound
 
-  StaticJsonBuffer<200> jsonBuffer;
-  JsonObject& json = jsonBuffer.parseObject(buf.get());
-
-  if (!json.success()) {
-    Serial.println("Failed to parse config file");
-    return false;
-  }
-
-  alarmHour = json["alarmHour"];
-  alarmMinute = json["alarmMinute"];
-  alarmActive = json["alarmActive"];
   return true;
 }
 
-bool saveConfig() {
-  StaticJsonBuffer<200> jsonBuffer;
-  JsonObject& json = jsonBuffer.createObject();
-  json["alarmHour"] = alarmHour;
-  json["alarmMinute"] = alarmMinute;
-  json["alarmActive"] = alarmActive;
-
-  File configFile = SPIFFS.open("/alarm.json", "w");
+bool saveConfig() 
+{
+  File configFile = SPIFFS.open("/alarm.dat", "w");
   if (!configFile) {
-    Serial.println("Failed to open config file for writing");
+    Serial.println("Failed to open config file for writing");	// doesn't actually print
     return false;
   }
 
-  json.printTo(configFile);
+  configFile.write((unsigned char *) &alarmInfo, sizeof(alarmInfo));
+  configFile.close();
+  
   return true;
 }
 
-int alarmDay;
-
-void handleSetAlarm() {
-  Serial.println("Setting Alarm");
-  for (uint8_t i = 0; i < server.args(); i++) {
-    if (server.argName(i) == "alarm") {
-      String alarm = server.arg(i);
-      int indexOfColon = alarm.indexOf(":");
-      alarmHour = alarm.substring(0, indexOfColon).toInt();
-      alarmMinute = alarm.substring(indexOfColon + 1).toInt();
-      alarmDay = alarm.substring(alarm.indexOf(";")+1).toInt();
-      alarmActive = (alarmHour == 0 && alarmMinute == 0) ? false : true;
-      saveConfig();
-      Serial.print("Setting Alarm to: ");
-      Serial.print(alarmHour);
-      Serial.print(":");
-      Serial.print(alarmMinute);
-      Serial.print(";");
-      Serial.print(alarmDay);
-    }
-  }
-  server.send(200, "text/html", "Set Alarm");
-}
 
 void soundAlarm() 
 {
@@ -470,7 +526,7 @@ void soundAlarm()
 		return;
 
 	if (!rtttl::isPlaying())
-		rtttl::begin(ALARM, alarmSound);
+		rtttl::begin(ALARM, alarmInfo.alarmSound);
 }
 
 // current real-time state of the buttons
@@ -586,13 +642,16 @@ PT_THREAD(AlarmThread())
 
 	int timeHour;
 	int timeMinutes;
+	int timeDay;
+	
 	boolean alarmCheck = false;	// once each minute this is set to true;
 	
 	unsigned long epoch = usMT.toLocal(timeClient.getEpochTime());
 	
 	timeHour = (epoch % 86400L) / 3600;
 	timeMinutes = (epoch % 3600) / 60;
-
+	timeDay = (((epoch  / 86400L) + 4 ) % 7); //0 is Sunday
+	
 	// check at each minute change for alarm activation
 	if (timeMinutes != alarmThreadState.lastMinute)
 		alarmCheck = true;
@@ -606,7 +665,9 @@ PT_THREAD(AlarmThread())
 	while(1)
 	{
 	    // alarm check
-	    PT_WAIT_UNTIL(globalAlarmState && alarmCheck && timeHour == alarmHour && timeMinutes == alarmMinute);
+	    PT_WAIT_UNTIL(pt, globalAlarmState && alarmCheck 
+	    	&& timeHour == alarmInfo.alarmDay[timeDay].alarmHour 
+	    	&& timeMinutes == alarmInfo.alarmDay[timeDay].alarmMinute);
 
 		while (buttons == 0)
 		{
@@ -649,6 +710,8 @@ void loop()
 			globalAlarmState = !globalAlarmState;
 			// reset timer
 			buttonDownStartTime = 0;
+
+			soundAlarm();	// play a sample of the alarm (if enabled)
 		}
 	} else
 		buttonDownStartTime = 0;
