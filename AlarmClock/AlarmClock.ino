@@ -551,8 +551,9 @@ uint8_t ButtonChange()
 	return(retval);
 }
 
-#define timeUpdateInterval (1000 * 60 * 1)
-#define errorTimeUpdateInterval	(1000 * 30)
+// these two intervals are in milliseconds so 60*1000 = 1 minute
+#define timeUpdateInterval (1000 * 60 * 15)
+#define errorTimeUpdateInterval	(1000 * 60)
 
 PT_THREAD(DisplayUpdateThread(void))
 {
